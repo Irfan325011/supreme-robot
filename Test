@@ -1,0 +1,296 @@
+local RS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LP = Players.LocalPlayer
+
+local library = loadstring(game:HttpGet('https://raw.githubusercontent.com/ovoch228/depthsoimgui/refs/heads/main/library'))()
+
+local teamwork = RS:WaitForChild("Teawork")
+local client = teamwork:WaitForChild("Client")
+local shared = teamwork:WaitForChild("Shared")
+
+local bytenet = require(shared.Services.ByteNetworking)
+local modifiersmodule = require(client.Services.Game.ModifierController)
+local datamodule = require(client.Services.DataSync)
+
+local towers = bytenet.Towers
+local mapinfo = RS:WaitForChild("RoundInfo")
+local roundresultui = LP.PlayerGui:WaitForChild("GameUI"):WaitForChild("RoundResult")
+
+local env = getgenv()
+env.StratName = env.StratName or "MyStrat"
+env.timer = 0
+env.wave = mapinfo:GetAttribute("Wave") or 1
+env.map = mapinfo:GetAttribute("Map")
+env.totalPlaced = 0
+env.firstTower = 1
+env.isRoundOver = false
+env.recording = false
+env.selectedMacro = nil
+env.timeMultiplier = 2  -- Default 2x (you can change in Settings)
+
+-- Timer (respects your speed slider)
+task.spawn(function()
+	local last = os.time()
+	while true do
+		env.timer = (os.time() - last) * env.timeMultiplier
+		task.wait(0.25)
+	end
+end)
+
+mapinfo:GetAttributeChangedSignal("Wave"):Connect(function()
+	env.wave = mapinfo:GetAttribute("Wave")
+end)
+
+roundresultui:GetPropertyChangedSignal("Visible"):Connect(function()
+	env.isRoundOver = roundresultui.Visible
+end)
+
+local function now()
+	return DateTime.now():FormatLocalTime("HH:mm:ss", "en-us")
+end
+
+-- ==================== NEW & IMPROVED UI ====================
+local window = library:CreateWindow({
+	Title = "My Custom Retro TD Macro",
+	Size = UDim2.new(0, 420, 0, 480),
+	Position = UDim2.new(0.5, 0, 0, 60),
+	NoResize = false
+})
+window:Center()
+
+local playtab = window:CreateTab({ Name = "Macro Player", Visible = true })
+local rectab = window:CreateTab({ Name = "Recorder", Visible = true })
+local logstab = window:CreateTab({ Name = "Logs", Visible = true })
+local settingstab = window:CreateTab({ Name = "Settings", Visible = true })
+
+-- Settings tab (this is the UI change you wanted)
+settingstab:Label({ Text = "Playback Speed" })
+settingstab:Slider({
+	Label = "Speed Multiplier",
+	Min = 1,
+	Max = 5,
+	Default = 2,
+	Step = 0.5,
+	Callback = function(v)
+		env.timeMultiplier = v
+		updatelog("Speed set to " .. v .. "x (faster = more risk of lag)")
+	end
+})
+
+local nameLabel = rectab:Label({ Text = "StratName: " .. env.StratName })
+rectab:InputText({
+	Label = "",
+	PlaceHolder = "Macro Name",
+	Callback = function(t)
+		env.StratName = t.Value
+		nameLabel:SetText("StratName: " .. env.StratName)
+	end
+})
+
+-- Logs
+local loglabel = logstab:Label({ Label = "Last Log: Idle" })
+logstab:Separator({ Text = "Logs:" })
+local logs = logstab:Console({
+	Text = "",
+	ReadOnly = true,
+	Fill = true,
+	AutoScroll = true,
+	MaxLines = 200
+})
+
+local function updatelog(txt)
+	logs:AppendText(now() .. ": " .. txt .. "\n")
+	loglabel:SetText("Last Log: " .. txt)
+end
+
+-- Macro file handling
+local function getMacros()
+	local files = {}
+	for _, f in ipairs(listfiles("")) do
+		if f:sub(-4) == ".txt" then table.insert(files, f) end
+	end
+	return files
+end
+
+local macroCombo
+local function createMacroCombo()
+	local files = getMacros()
+	if macroCombo and macroCombo.Remove then macroCombo:Remove() end
+	macroCombo = playtab:Combo({
+		Label = "Select Macro",
+		Placeholder = "Choose macro... (" .. #files .. " found)",
+		Items = files,
+		Callback = function(self, value)
+			env.selectedMacro = value
+			updatelog("Selected: " .. (value or "none"))
+		end
+	})
+end
+createMacroCombo()
+
+playtab:Button({ Text = "Refresh Macros", Callback = function() createMacroCombo() end })
+
+playtab:Button({
+	Text = "▶ Play Selected Macro",
+	Callback = function()
+		if not env.selectedMacro then updatelog("No macro selected") return end
+		updatelog("Playing: " .. env.selectedMacro)
+		local success, err = pcall(function()
+			loadstring(readfile(env.selectedMacro))()
+		end)
+		if success then
+			updatelog("Macro started successfully!")
+		else
+			updatelog("Error: " .. tostring(err))
+		end
+	end
+})
+
+-- ==================== API (fixed & combined) ====================
+local api = {}
+
+function api:Loadout(towersList)
+	if game.PlaceId \~= 98936097545088 then return end
+	for i, tower in ipairs(towersList) do
+		bytenet.Inventory.EquipTower.invoke({TowerID = tower, Slot = i})
+		task.wait(0.5)
+	end
+end
+
+function api:Map(mapName, mods)
+	if game.PlaceId \~= 98936097545088 then return end
+	bytenet.MatchmakingNew.CreateSingleplayer.invoke({Gamemode = "Standard", MapID = mapName, Modifiers = mods})
+end
+
+function api:Start()
+	bytenet.Timescale.SetTimescale.send(env.timeMultiplier)
+	env.lastTime = os.time()
+	env.timer = 0
+	updatelog("Game started @ " .. env.timeMultiplier .. "x speed")
+end
+
+local function waitTime(t, w)
+	while env.wave < w and not env.isRoundOver do task.wait(0.03) end
+	while env.timer < t and not env.isRoundOver do task.wait(0.03) end
+	return not env.isRoundOver
+end
+
+function api:Ready(t, w) if waitTime(t, w) then bytenet.ReadyVote.Vote.send(true) end end
+function api:Skip(t, w) if waitTime(t, w) then RS.ByteNetReliable:FireServer(buffer.fromstring("\148\001")) end end
+function api:AutoSkip(v, t, w) if waitTime(t, w) then bytenet.SkipWave.ToggleAutoSkip.send(v) end end
+
+function api:Place(id, pos, t, w)
+	if waitTime(t, w) then
+		env.totalPlaced += 1
+		towers.PlaceTower.invoke({TowerID = id, Position = pos, Rotation = 0})
+	end
+end
+
+function api:Upgrade(i, t, w)
+	if waitTime(t, w) then
+		towers.UpgradeTower.invoke(env.firstTower + (i - 1))
+	end
+end
+
+function api:SetTarget(i, mode, t, w)
+	if waitTime(t, w) then
+		towers.SetTargetMode.send({UID = env.firstTower + (i - 1), TargetMode = mode})
+	end
+end
+
+function api:Sell(i, t, w)
+	if waitTime(t, w) then
+		towers.SellTower.invoke(env.firstTower + (i - 1))
+	end
+end
+
+function api:PlayAgain()
+	while not env.isRoundOver do task.wait(0.1) end
+	env.firstTower = env.totalPlaced + 1
+	env.totalPlaced = 0
+	env.timer = 0
+	env.wave = 1
+	task.wait(1)
+	bytenet.RoundResult.VoteForRestart.send(true)
+end
+
+-- ==================== RECORDER ====================
+rectab:Button({
+	Text = "Start Recording",
+	Callback = function()
+		local towersEquipped = datamodule:Get().EquippedTowers
+		local mods = modifiersmodule.GetModifiers()
+		local t, m = {}, {}
+		for _, v in ipairs(towersEquipped) do table.insert(t, "'" .. v .. "'") end
+		for _, v in ipairs(mods) do table.insert(m, "'" .. v .. "'") end
+
+		writefile(env.StratName .. ".txt",
+			"RTD_API:Loadout({" .. table.concat(t, ", ") .. "})\n" ..
+			"RTD_API:Map('" .. env.map .. "', {" .. table.concat(m, ", ") .. "})\n\n" ..
+			"RTD_API:Start()\n\n"
+		)
+		env.recording = true
+		updatelog("Recording started → " .. env.StratName .. ".txt")
+	end
+})
+
+rectab:Button({
+	Text = "Stop Recording",
+	Callback = function()
+		if env.recording then
+			env.recording = false
+			updatelog("Recording stopped")
+			createMacroCombo()
+		end
+	end
+})
+
+-- Hooks (fixed prefix)
+local function record(line)
+	if env.recording then
+		appendfile(env.StratName .. ".txt", "RTD_API:" .. line .. "\n")
+	end
+end
+
+local hooks = {}
+hooks.place = hookfunction(towers.PlaceTower.invoke, function(d)
+	if checkcaller() then return hooks.place(d) end
+	record("Place('" .. d.TowerID .. "', Vector3.new(" .. d.Position.X .. "," .. d.Position.Y .. "," .. d.Position.Z .. "), " .. math.floor(env.timer) .. ", " .. env.wave .. ")")
+	return hooks.place(d)
+end)
+
+hooks.upgrade = hookfunction(towers.UpgradeTower.invoke, function(i)
+	if checkcaller() then return hooks.upgrade(i) end
+	record("Upgrade(" .. i .. ", " .. math.floor(env.timer) .. ", " .. env.wave .. ")")
+	return hooks.upgrade(i)
+end)
+
+hooks.sell = hookfunction(towers.SellTower.invoke, function(i)
+	if checkcaller() then return hooks.sell(i) end
+	record("Sell(" .. i .. ", " .. math.floor(env.timer) .. ", " .. env.wave .. ")")
+	return hooks.sell(i)
+end)
+
+hooks.target = hookfunction(towers.SetTargetMode.send, function(d)
+	if checkcaller() then return hooks.target(d) end
+	record("SetTarget(" .. d.UID .. ", '" .. d.TargetMode .. "', " .. math.floor(env.timer) .. ", " .. env.wave .. ")")
+	return hooks.target(d)
+end)
+
+hooks.ready = hookfunction(bytenet.ReadyVote.Vote.send, function(v)
+	if checkcaller() then return hooks.ready(v) end
+	record("Ready(" .. math.floor(env.timer) .. ", " .. env.wave .. ")")
+	return hooks.ready(v)
+end)
+
+hooks.autoskip = hookfunction(bytenet.SkipWave.ToggleAutoSkip.send, function(v)
+	if checkcaller() then return hooks.autoskip(v) end
+	record("AutoSkip(" .. tostring(v) .. ", " .. math.floor(env.timer) .. ", " .. env.wave .. ")")
+	return hooks.autoskip(v)
+end)
+
+-- Expose API so macros can use it
+getgenv().RTD_API = api
+
+updatelog("✅ Macro loaded! Use the Settings tab to go faster.")
+window:ShowTab(playtab)
